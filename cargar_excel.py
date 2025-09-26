@@ -1,133 +1,123 @@
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
-import numpy as np
+import time
 import requests
-import base64
+from requests.auth import HTTPBasicAuth
+from lxml import etree
+
+# ---------------- CONFIGURACIÓN ----------------
+KIE_SERVER = "http://localhost:8080/kie-server/services/rest/server"
+CONTAINER_ID = "Publica_In_Out_1.0.0-SNAPSHOT"
+PROCESS_ID = "Publica_In_Out.Publica"
+USER = "wbadmin"
+PASSWORD = "wbadmin"
 
 app = Flask(__name__)
 
-# -------------------- Configuración KIE --------------------
-KIE_BASE = "http://localhost:8080/kie-server/services/rest/server"
-CONTAINER_ID = "Publica_In_Out_1.0.0-SNAPSHOT"
-PROCESS_ID = "Publica_In_Out.Publica"
-USERNAME = "wbadmin"
-PASSWORD = "wbadmin"
-
-auth_header = {
-    "Content-Type": "application/json",
-    "Authorization": "Basic " + base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
-}
-
-# -------------------- Funciones auxiliares --------------------
-def make_serializable(val):
-    try:
-        if pd.isna(val):
-            return None
-    except Exception:
-        pass
-    if isinstance(val, (np.integer,)):
-        return int(val)
-    if isinstance(val, (np.floating,)):
-        return float(val)
-    if isinstance(val, (np.bool_, bool)):
-        return bool(val)
-    if isinstance(val, pd.Timestamp):
-        return val.isoformat()
-    if isinstance(val, np.datetime64):
-        return pd.to_datetime(val).isoformat()
-    return val
-
-def start_process(variables):
-    """Crea una instancia del proceso con las variables"""
-    url = f"{KIE_BASE}/containers/{CONTAINER_ID}/processes/{PROCESS_ID}/instances"
-    print(f"🔹 Enviando variables al proceso: {variables}")
-    resp = requests.post(url, headers=auth_header, json=variables)
+# ---------------- FUNCIONES ----------------
+def start_process():
+    """Inicia un proceso y devuelve su process instance ID"""
+    url = f"{KIE_SERVER}/containers/{CONTAINER_ID}/processes/{PROCESS_ID}/instances"
+    resp = requests.post(url, json={}, auth=HTTPBasicAuth(USER, PASSWORD))
     resp.raise_for_status()
-    pid = int(resp.text)
-    print(f"✅ Proceso creado con processInstanceId: {pid}")
+    pid = resp.text.strip()
+    print(f"🟢 Proceso iniciado con PID: {pid}")
     return pid
 
-def complete_task(task_id, variables):
-    url = f"{KIE_BASE}/containers/{CONTAINER_ID}/tasks/{task_id}/states/completed"
-    payload = {
-        "user": USERNAME,        # nombre del usuario que completa la tarea
-        "task-output": variables # variables para la tarea
-    }
-    resp = requests.put(url, headers=auth_header, json=payload)
+def parse_tasks_xml(tasks_xml, pid):
+    """Parsea el XML de tareas usando lxml y maneja namespaces automáticamente"""
+    root = etree.fromstring(tasks_xml.encode())
+    tasks = []
+    # buscar task-summary ignorando namespaces
+    for ts in root.xpath("//*[local-name()='task-summary']"):
+        task_proc_id = int(ts.xpath("*[local-name()='task-proc-inst-id']/text()")[0])
+        if task_proc_id == int(pid):
+            task_id = int(ts.xpath("*[local-name()='task-id']/text()")[0])
+            tasks.append({"task-id": task_id, "task-proc-inst-id": task_proc_id})
+    return pd.DataFrame(tasks)
+
+def get_tasks(pid):
+    """Obtiene todas las tareas de la instancia"""
+    url = f"{KIE_SERVER}/queries/tasks/instances/pot-owners?containerId={CONTAINER_ID}"
+    for _ in range(20):  # esperar hasta 20 ciclos de 1s
+        resp = requests.get(url, auth=HTTPBasicAuth(USER, PASSWORD))
+        resp.raise_for_status()
+        tasks_xml = resp.text
+        try:
+            tasks = parse_tasks_xml(tasks_xml, pid)
+            if not tasks.empty:
+                return tasks
+        except Exception as e:
+            print(f"⚠️ Error leyendo XML de tareas: {e}")
+        time.sleep(1)
+    return pd.DataFrame()
+
+def complete_task(task_id, data={}):
+    """Completa una tarea con los datos proporcionados"""
+    url = f"{KIE_SERVER}/containers/{CONTAINER_ID}/tasks/{task_id}/states/completed"
+    resp = requests.put(url, json=data, auth=HTTPBasicAuth(USER, PASSWORD))
     resp.raise_for_status()
     print(f"✅ Tarea {task_id} completada")
 
-# -------------------- Rutas Flask --------------------
+# ---------------- RUTAS FLASK ----------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
 @app.route("/cargar_excel", methods=["POST"])
 def cargar_excel():
     if "file" not in request.files:
         return jsonify({"error": "No se envió ningún archivo"}), 400
 
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "Archivo vacío"}), 400
-
     try:
-        #LEE LA PRIMER HOJA DEL EXCEL
-        df = pd.read_excel(file).replace([np.inf, -np.inf], np.nan)
-
-        # ⬅ Aquí forzamos la columna a tipo datetime
-        df['fec_oficio_sol'] = pd.to_datetime(df['fec_oficio_sol'], errors='coerce')
-
-        filas_raw = df.to_dict(orient="records")
-        filas = [{k: make_serializable(v) for k, v in row.items()} for row in filas_raw]
-
-        resultados = []
-        for idx, fila in enumerate(filas, start=1):
-            print(f"\n=== Procesando fila {idx}: {fila} ===")
-
-            # Filtrar solo variables con valor
-            variables = {k: v for k, v in fila.items() if v is not None}
-
-            # Crear instancia de proceso
-            pid = start_process(variables)
-
-            # Obtener la tarea activa asociada a esta instancia
-            url_tasks = f"{KIE_BASE}/queries/tasks/instances/pot-owners?processInstanceId={pid}"
-            resp_tasks = requests.get(url_tasks, headers=auth_header)
-            resp_tasks.raise_for_status()
-            tasks = resp_tasks.json().get('task-summary', [])
-
-            if tasks:
-                task_id = tasks[0]['task-id']  # tomamos la primera tarea
-                
-                # 1️⃣ Claim la tarea
-                requests.put(f"{KIE_BASE}/containers/{CONTAINER_ID}/tasks/{task_id}/states/claimed",
-                            headers=auth_header, json={"user": USERNAME}).raise_for_status()
-
-                # 2️⃣ Start la tarea
-                requests.put(f"{KIE_BASE}/containers/{CONTAINER_ID}/tasks/{task_id}/states/started",
-                            headers=auth_header, json={"user": USERNAME}).raise_for_status()
-
-                # 3️⃣ Complete la tarea
-                requests.put(f"{KIE_BASE}/containers/{CONTAINER_ID}/tasks/{task_id}/states/completed",
-                            headers=auth_header, json={"user": USERNAME, "task-output": variables}).raise_for_status()
-
-
-                
-                
-                # complete_task(task_id, variables)  # completamos la tarea con las mismas variables
-
-            resultados.append({
-                "fila": fila,
-                "status": "instance_created",
-                "process_instance_id": pid
-            })
-
-        return jsonify({"processed": len(filas), "results": resultados})
-
+        excel_data = pd.read_excel(file, sheet_name=None)  # leer todas las hojas
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"No se pudo leer el Excel: {e}"}), 400
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+    resultados = []
 
-# -------------------- Ejecutar Flask --------------------
+    # número de filas de la primera hoja
+    num_rows = len(next(iter(excel_data.values())))
+
+    for index in range(num_rows):
+        try:
+            pid = start_process()
+        except requests.exceptions.HTTPError as e:
+            print(f"⚠️ Error iniciando proceso: {e}")
+            resultados.append({"row": index, "status": "Error iniciar proceso"})
+            continue
+
+        tasks = get_tasks(pid)
+        if tasks.empty:
+            print(f"⚠️ No se encontraron tareas para PID {pid}")
+            resultados.append({"row": index, "status": "No hay tareas"})
+            continue
+
+        # completar tareas en orden según hojas del Excel
+        for i, (sheet_name, df) in enumerate(excel_data.items()):
+            if i >= len(tasks):
+                break
+            task_id = tasks.iloc[i]["task-id"]
+            row_data = df.iloc[index].to_dict()
+
+            # Convertir Timestamps y NaN a valores JSON serializables
+            for k, v in row_data.items():
+                if pd.isna(v):
+                    row_data[k] = None
+                elif isinstance(v, pd.Timestamp):
+                    row_data[k] = v.isoformat()
+
+            try:
+                complete_task(task_id, row_data)
+            except requests.exceptions.HTTPError as e:
+                print(f"⚠️ Error completando tarea {task_id}: {e}")
+                continue
+
+        resultados.append({"row": index, "status": "Proceso completado"})
+
+    return jsonify(resultados)
+
+# ---------------- EJECUCIÓN ----------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
